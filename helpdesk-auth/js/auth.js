@@ -1,347 +1,157 @@
-/* ================================================================
-   auth.js — Login, cadastro e validação por token (integração via API)
-================================================================ */
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
+const { authMiddleware } = require('../middleware/auth');
 
-const AUTH_STORAGE_KEY = 'helpdesk_auth_session';
-const AUTH_PENDING_KEY = 'helpdesk_auth_pending_email';
-const AUTH_API_BASE = window.AUTH_API_BASE || '/api/auth';
+const router = express.Router();
+const TOKEN_TTL_MINUTES = 15;
 
-let authAppStarted = false;
-
-function getSession(){
-  try {
-    const raw = localStorage.getItem(AUTH_STORAGE_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch(err){
-    console.warn('[Auth] Erro ao ler sessão:', err);
-    return null;
-  }
+function generateToken() {
+  return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-function saveSession(session){
-  localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({
-    token: session.token || session.sessionToken || '',
-    user: {
-      name: session.user?.name || 'Usuário',
-      role: session.user?.role || 'Acesso autenticado',
-      email: session.user?.email || ''
-    }
-  }));
-}
-
-function clearSession(){
-  localStorage.removeItem(AUTH_STORAGE_KEY);
-}
-
-function getPendingEmail(){
-  return sessionStorage.getItem(AUTH_PENDING_KEY) || '';
-}
-
-function setPendingEmail(email){
-  sessionStorage.setItem(AUTH_PENDING_KEY, email || '');
-}
-
-function clearPendingEmail(){
-  sessionStorage.removeItem(AUTH_PENDING_KEY);
-}
-
-function getInitials(name){
-  const parts = String(name || 'Usuário').trim().split(/\s+/).slice(0,2);
-  return parts.map(p => p[0]?.toUpperCase() || '').join('') || 'US';
-}
-
-function getAuthHeaders(){
-  const session = getSession();
-  return session?.token ? { Authorization: `Bearer ${session.token}` } : {};
-}
-
-async function authRequest(path, payload){
-  const res = await fetch(`${AUTH_API_BASE}${path}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...getAuthHeaders()
+function buildSession(user) {
+  const token = jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role
     },
-    body: JSON.stringify(payload || {})
+    process.env.JWT_SECRET,
+    { expiresIn: '12h' }
+  );
+
+  return {
+    message: 'Autenticação concluída com sucesso.',
+    token,
+    user: {
+      name: user.name,
+      role: user.role,
+      email: user.email
+    }
+  };
+}
+
+function createTransporter() {
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    throw new Error('SMTP não configurado. Preencha SMTP_HOST, SMTP_USER e SMTP_PASS.');
+  }
+
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || 'false') === 'true',
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    }
   });
-
-  let data = {};
-  try {
-    data = await res.json();
-  } catch(err){
-    data = {};
-  }
-
-  if(!res.ok){
-    throw new Error(data.message || 'Não foi possível concluir a operação de autenticação.');
-  }
-
-  return data;
 }
 
-function setAuthLoading(formId, isLoading){
-  const form = document.getElementById(formId);
-  if(!form) return;
-  form.querySelectorAll('button, input').forEach(el => el.disabled = isLoading);
-}
-
-function renderAuthScreen(mode = 'login'){
-  const root = document.getElementById('auth-screen');
-  if(!root) return;
-
-  const pendingEmail = getPendingEmail();
-
-  root.innerHTML = `
-    <section class="auth-shell">
-      <div class="auth-hero">
-        <div class="auth-brand-badge">Brava Wine • HelpDesk Pro</div>
-        <h1>Controle de chamados com acesso protegido</h1>
-        <p>
-          Faça login para acessar o painel ou crie seu primeiro acesso.
-          No cadastro, um token será enviado para o e-mail informado para validar a conta.
-        </p>
-        <div class="auth-hero-cards">
-          <div class="auth-info-card">
-            <i class="fa-solid fa-shield-halved"></i>
-            <div>
-              <strong>Validação por e-mail</strong>
-              <span>Cadastro liberado somente após confirmação do token.</span>
-            </div>
+async function sendVerificationEmail(email, name, token) {
+  const transporter = createTransporter();
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || process.env.SMTP_USER,
+    to: email,
+    subject: 'HelpDesk Brava Wine • Token de validação',
+    html: `
+      <div style="font-family:Arial,sans-serif;background:#0b1120;padding:32px;color:#f1f5f9">
+        <div style="max-width:560px;margin:0 auto;background:#0f172a;border:1px solid #1e3a5f;border-radius:16px;padding:28px">
+          <h2 style="margin-top:0">Olá, ${name}!</h2>
+          <p>Seu cadastro no <strong>HelpDesk Brava Wine</strong> foi iniciado.</p>
+          <p>Use o token abaixo para validar o primeiro acesso:</p>
+          <div style="font-size:32px;font-weight:800;letter-spacing:8px;text-align:center;background:#1a2540;border-radius:12px;padding:18px;margin:24px 0;color:#67e8f9">
+            ${token}
           </div>
-          <div class="auth-info-card">
-            <i class="fa-solid fa-user-lock"></i>
-            <div>
-              <strong>Acesso individual</strong>
-              <span>Cada usuário entra com e-mail e senha próprios.</span>
-            </div>
-          </div>
-          <div class="auth-info-card">
-            <i class="fa-solid fa-chart-line"></i>
-            <div>
-              <strong>Painel protegido</strong>
-              <span>Dashboard e chamados ficam ocultos até autenticação.</span>
-            </div>
-          </div>
+          <p>Esse token expira em ${TOKEN_TTL_MINUTES} minutos.</p>
         </div>
       </div>
-
-      <div class="auth-card">
-        <div class="auth-tabs">
-          <button class="auth-tab ${mode === 'login' ? 'active' : ''}" onclick="renderAuthScreen('login')">Entrar</button>
-          <button class="auth-tab ${mode === 'register' ? 'active' : ''}" onclick="renderAuthScreen('register')">Cadastrar</button>
-          <button class="auth-tab ${mode === 'verify' ? 'active' : ''}" onclick="renderAuthScreen('verify')">Validar token</button>
-        </div>
-
-        <div class="auth-panel ${mode === 'login' ? 'active' : ''}">
-          <div class="auth-panel-head">
-            <h2>Login</h2>
-            <p>Entre com seu e-mail e senha para acessar o sistema.</p>
-          </div>
-          <form id="login-form" class="auth-form" onsubmit="submitLogin(event)">
-            <div class="form-group">
-              <label class="form-label">E-mail corporativo</label>
-              <input id="login-email" class="form-control" type="email" placeholder="voce@empresa.com" required />
-            </div>
-            <div class="form-group">
-              <label class="form-label">Senha</label>
-              <input id="login-password" class="form-control" type="password" placeholder="Digite sua senha" required />
-            </div>
-            <button class="btn btn-primary auth-submit" type="submit">
-              <i class="fa-solid fa-right-to-bracket"></i> Entrar no sistema
-            </button>
-          </form>
-        </div>
-
-        <div class="auth-panel ${mode === 'register' ? 'active' : ''}">
-          <div class="auth-panel-head">
-            <h2>Primeiro acesso</h2>
-            <p>Cadastre o usuário e confirme o token enviado ao e-mail informado.</p>
-          </div>
-          <form id="register-form" class="auth-form" onsubmit="submitRegister(event)">
-            <div class="auth-grid">
-              <div class="form-group">
-                <label class="form-label">Nome completo</label>
-                <input id="register-name" class="form-control" type="text" placeholder="Ex: Ricardo Souza" required />
-              </div>
-              <div class="form-group">
-                <label class="form-label">Perfil / cargo</label>
-                <input id="register-role" class="form-control" type="text" placeholder="Ex: Supervisor TI" required />
-              </div>
-            </div>
-            <div class="form-group">
-              <label class="form-label">E-mail</label>
-              <input id="register-email" class="form-control" type="email" placeholder="voce@empresa.com" required />
-            </div>
-            <div class="auth-grid">
-              <div class="form-group">
-                <label class="form-label">Senha</label>
-                <input id="register-password" class="form-control" type="password" placeholder="Mínimo 6 caracteres" minlength="6" required />
-              </div>
-              <div class="form-group">
-                <label class="form-label">Confirmar senha</label>
-                <input id="register-password-confirm" class="form-control" type="password" placeholder="Repita a senha" minlength="6" required />
-              </div>
-            </div>
-            <button class="btn btn-primary auth-submit" type="submit">
-              <i class="fa-solid fa-envelope-circle-check"></i> Cadastrar e enviar token
-            </button>
-          </form>
-        </div>
-
-        <div class="auth-panel ${mode === 'verify' ? 'active' : ''}">
-          <div class="auth-panel-head">
-            <h2>Validar cadastro</h2>
-            <p>Informe o e-mail e o token recebido para liberar o primeiro acesso.</p>
-          </div>
-          <form id="verify-form" class="auth-form" onsubmit="submitVerification(event)">
-            <div class="form-group">
-              <label class="form-label">E-mail</label>
-              <input id="verify-email" class="form-control" type="email" value="${pendingEmail}" placeholder="voce@empresa.com" required />
-            </div>
-            <div class="form-group">
-              <label class="form-label">Token de verificação</label>
-              <input id="verify-token" class="form-control auth-token-input" type="text" placeholder="Ex: 123456" maxlength="8" required />
-            </div>
-            <button class="btn btn-primary auth-submit" type="submit">
-              <i class="fa-solid fa-badge-check"></i> Validar token
-            </button>
-            <button class="btn btn-outline auth-submit" type="button" onclick="resendVerificationToken()">
-              <i class="fa-solid fa-paper-plane"></i> Reenviar token
-            </button>
-          </form>
-        </div>
-      </div>
-    </section>
-  `;
+    `
+  });
 }
 
-function applyAuthUserUI(){
-  const session = getSession();
-  const avatar = document.getElementById('auth-user-avatar');
-  const nameEl = document.getElementById('auth-user-name');
-  const roleEl = document.getElementById('auth-user-role');
-  const logoutBtn = document.getElementById('logout-btn');
-
-  if(avatar) avatar.textContent = getInitials(session?.user?.name || 'Admin Sistema');
-  if(nameEl) nameEl.textContent = session?.user?.name || 'Admin Sistema';
-  if(roleEl) roleEl.textContent = session?.user?.role || session?.user?.email || 'Supervisor TI';
-  if(logoutBtn) logoutBtn.style.display = session ? 'inline-flex' : 'none';
-}
-
-function showAuthenticatedApp(){
-  document.body.classList.remove('auth-only');
-  applyAuthUserUI();
-
-  if(!authAppStarted && typeof initializeApp === 'function'){
-    authAppStarted = true;
-    initializeApp();
-  }
-}
-
-function showAuthOnly(mode = 'login'){
-  document.body.classList.add('auth-only');
-  renderAuthScreen(mode);
-}
-
-function bootAuth(){
-  const session = getSession();
-  if(session?.token){
-    showAuthenticatedApp();
-    return;
-  }
-  showAuthOnly(getPendingEmail() ? 'verify' : 'login');
-}
-
-async function submitRegister(event){
-  event.preventDefault();
-
-  const name = document.getElementById('register-name').value.trim();
-  const role = document.getElementById('register-role').value.trim();
-  const email = document.getElementById('register-email').value.trim().toLowerCase();
-  const password = document.getElementById('register-password').value;
-  const passwordConfirm = document.getElementById('register-password-confirm').value;
-
-  if(password !== passwordConfirm){
-    toast('As senhas não conferem.', 'error');
-    return;
-  }
-
-  setAuthLoading('register-form', true);
+router.post('/register', async (req, res) => {
   try {
-    const data = await authRequest('/register', { name, role, email, password });
-    setPendingEmail(email);
-    renderAuthScreen('verify');
-    const verifyInput = document.getElementById('verify-email');
-    if(verifyInput) verifyInput.value = email;
-    toast(data.message || 'Cadastro iniciado. Verifique o token no seu e-mail.', 'success');
-  } catch(err){
-    toast(err.message || 'Não foi possível iniciar o cadastro.', 'error');
-  } finally {
-    setAuthLoading('register-form', false);
+    const db = req.app.locals.db;
+    const { name, role, email, password } = req.body || {};
+
+    if (!name || !role || !email || !password) {
+      return res.status(400).json({ message: 'Preencha todos os campos.' });
+    }
+
+    const normalizedEmail = String(email).trim().toLowerCase();
+
+    const existingUser = await db.get(
+      'SELECT id FROM users WHERE email = ?',
+      [normalizedEmail]
+    );
+
+    if (existingUser) {
+      return res.status(409).json({ message: 'Usuário já existe.' });
+    }
+
+    const bcrypt = require('bcryptjs');
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const result = await db.run(
+      `INSERT INTO users (name, role, email, password_hash)
+       VALUES (?, ?, ?, ?)`,
+      [name, role, normalizedEmail, passwordHash]
+    );
+
+    const user = await db.get(
+      'SELECT * FROM users WHERE id = ?',
+      [result.lastID]
+    );
+
+    // 🔥 já retorna login automático
+    return res.json(buildSession(user));
+
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Erro no cadastro.' });
   }
-}
+});
 
-async function submitVerification(event){
-  event.preventDefault();
 
-  const email = document.getElementById('verify-email').value.trim().toLowerCase();
-  const token = document.getElementById('verify-token').value.trim();
 
-  setAuthLoading('verify-form', true);
+router.post('/login', async (req, res) => {
   try {
-    const data = await authRequest('/verify-email', { email, token });
-    saveSession(data);
-    clearPendingEmail();
-    toast(data.message || 'Cadastro validado com sucesso!', 'success');
-    showAuthenticatedApp();
-  } catch(err){
-    toast(err.message || 'Token inválido ou expirado.', 'error');
-  } finally {
-    setAuthLoading('verify-form', false);
-  }
-}
+    const db = req.app.locals.db;
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
 
-async function resendVerificationToken(){
-  const email = document.getElementById('verify-email')?.value.trim().toLowerCase() || getPendingEmail();
-  if(!email){
-    toast('Informe o e-mail para reenviar o token.', 'error');
-    return;
-  }
+    const user = await db.get('SELECT * FROM users WHERE email = ? AND is_active = 1', [email]);
+    if (!user) {
+      return res.status(401).json({ message: 'Usuário ou senha inválidos.' });
+    }
 
-  setAuthLoading('verify-form', true);
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) {
+      return res.status(401).json({ message: 'Usuário ou senha inválidos.' });
+    }
+
+    return res.json(buildSession(user));
+  } catch (err) {
+    console.error('[login]', err);
+    return res.status(500).json({ message: 'Erro ao realizar login.' });
+  }
+});
+
+router.get('/me', authMiddleware, async (req, res) => {
   try {
-    const data = await authRequest('/resend-token', { email });
-    setPendingEmail(email);
-    toast(data.message || 'Token reenviado com sucesso.', 'success');
-  } catch(err){
-    toast(err.message || 'Não foi possível reenviar o token.', 'error');
-  } finally {
-    setAuthLoading('verify-form', false);
+    const db = req.app.locals.db;
+    const user = await db.get('SELECT id, name, role, email, is_active FROM users WHERE id = ?', [req.user.id]);
+    if (!user || !user.is_active) {
+      return res.status(404).json({ message: 'Usuário não encontrado.' });
+    }
+    res.json({ user: { name: user.name, role: user.role, email: user.email } });
+  } catch (err) {
+    console.error('[me]', err);
+    res.status(500).json({ message: 'Erro ao carregar usuário.' });
   }
-}
+});
 
-async function submitLogin(event){
-  event.preventDefault();
-
-  const email = document.getElementById('login-email').value.trim().toLowerCase();
-  const password = document.getElementById('login-password').value;
-
-  setAuthLoading('login-form', true);
-  try {
-    const data = await authRequest('/login', { email, password });
-    saveSession(data);
-    clearPendingEmail();
-    toast(data.message || 'Login realizado com sucesso!', 'success');
-    showAuthenticatedApp();
-  } catch(err){
-    toast(err.message || 'E-mail ou senha inválidos.', 'error');
-  } finally {
-    setAuthLoading('login-form', false);
-  }
-}
-
-function logout(){
-  clearSession();
-  showAuthOnly('login');
-  toast('Sessão encerrada com sucesso.', 'warn');
-}
+module.exports = router;
